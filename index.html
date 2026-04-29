@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Neural Dynamics V9.4 - Kinetic Obstacles & Audio Feedback</title>
+    <style>
+        body { margin: 0; background: #00050a; color: #00ffcc; font-family: 'Segoe UI', sans-serif; overflow: hidden; }
+        canvas { display: block; }
+        #ui { position: absolute; top: 20px; left: 20px; background: rgba(0, 8, 15, 0.9); padding: 20px; border: 1px solid #004444; z-index: 100; width: 320px; border-radius: 8px; backdrop-filter: blur(10px); }
+        #monitor-cluster { position: absolute; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 10px; z-index: 50; }
+        #entity-space { background: rgba(0, 15, 25, 0.9); border: 1px solid #00ffcc; border-radius: 4px; }
+        #thought-monitor { background: rgba(0, 8, 15, 0.8); border: 1px solid #00ffcc; border-radius: 4px; }
+        .header { font-size: 14px; letter-spacing: 2px; font-weight: bold; border-bottom: 1px solid #00ffcc; margin-bottom: 15px; padding-bottom: 8px; color: #fff; }
+        .stat { font-size: 10px; margin-bottom: 6px; display: flex; justify-content: space-between; font-family: 'Courier New', monospace; }
+        .val { color: #00ffcc; font-weight: bold; }
+        button { background: #00ffcc; border: none; color: #000; width: 100%; padding: 12px; cursor: pointer; margin-top: 15px; font-size: 11px; text-transform: uppercase; font-weight: bold; border-radius: 4px; transition: 0.3s; }
+        button:hover { opacity: 0.8; }
+        #audioToggle { background: #1a3333; color: #00ffcc; border: 1px solid #00ffcc; margin-top: 10px; }
+        input[type=range] { width: 100%; height: 4px; background: #1a3333; outline: none; -webkit-appearance: none; margin: 10px 0; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; background: #00ffcc; cursor: pointer; border-radius: 50%; }
+    </style>
+</head>
+<body>
+
+<div id="ui">
+    <div class="header">CORTICAL SYS V9.4</div>
+    <div class="stat"><label>GAIN (STIMULUS)</label><span class="val" id="gVal">3.0x</span></div>
+    <input type="range" id="gainSlider" min="0.1" max="15" step="0.1" value="3">
+    <div class="stat"><label>INTERNAL NOISE</label><span class="val" id="nVal">0.2</span></div>
+    <input type="range" id="noiseSlider" min="0" max="2" step="0.1" value="0.2">
+    <div style="margin-top: 20px; border-top: 1px solid #1a3333; padding-top: 15px;">
+        <div class="stat">ACTIVE SYNAPSES: <span class="val" id="synCount">0</span></div>
+        <div class="stat">MODE: <span class="val" id="modeStat">STABLE</span></div>
+    </div>
+    <button id="btn">ACTIVATE CORTEX</button>
+    <button id="audioToggle">AUDIO: ON</button>
+</div>
+
+<div id="monitor-cluster">
+    <canvas id="entity-space" width="300" height="150"></canvas>
+    <canvas id="thought-monitor" width="300" height="150"></canvas>
+</div>
+
+<canvas id="canvas"></canvas>
+
+<script>
+const IZ_A = 0.02, IZ_B = 0.2, IZ_C = -65, IZ_D = 8, V_PEAK = 30, DALE_RATIO = 0.8;
+const canvas = document.getElementById('canvas'), ctx = canvas.getContext('2d', { alpha: false });
+const tCanvas = document.getElementById('thought-monitor'), tCtx = tCanvas.getContext('2d'), eCanvas = document.getElementById('entity-space'), eCtx = eCanvas.getContext('2d');
+
+let w, h, neurons = [], synapses = [], audioData, analyser, audioCtx;
+let oscillator, synthGain, soundEnabled = true; 
+let gain = 3.0, noiseAmp = 0.2, synapseMap = new Map(), history = []; 
+let agent = { x: 150, y: 75, angle: Math.random() * Math.PI * 2, speed: 0, size: 5, trail: [] };
+
+let obstacles = [
+    { x: 80, y: 50, r: 15, vx: 0, vy: 0 },
+    { x: 220, y: 110, r: 20, vx: 0, vy: 0 },
+    { x: 150, y: 75, r: 12, vx: 0, vy: 0 },
+    { x: 50, y: 120, r: 18, vx: 0, vy: 0 }
+];
+
+function resize() { w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; }
+window.onresize = resize; resize();
+
+document.getElementById('gainSlider').oninput = (e) => { gain = parseFloat(e.target.value); document.getElementById('gVal').innerText = gain.toFixed(1) + "x"; };
+document.getElementById('noiseSlider').oninput = (e) => { noiseAmp = parseFloat(e.target.value); document.getElementById('nVal').innerText = noiseAmp.toFixed(1); };
+
+// Toggle Audio
+document.getElementById('audioToggle').onclick = (e) => {
+    soundEnabled = !soundEnabled;
+    e.target.innerText = soundEnabled ? "AUDIO: ON" : "AUDIO: OFF";
+    e.target.style.color = soundEnabled ? "#00ffcc" : "#ff2864";
+    if (!soundEnabled && synthGain) {
+        synthGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.05);
+    }
+};
+
+class Neuron {
+    constructor(id) {
+        this.id = id;
+        this.type = Math.random() < DALE_RATIO ? 'E' : 'I';
+        this.v = IZ_C; this.u = IZ_B * this.v;
+        this.pos = { x: (Math.random()-0.5)*850, y: (Math.random()-0.5)*550, z: (Math.random()-0.5)*550 };
+        this.firingStatus = 0; this.inputCurrent = 0; this.lastSpikeTime = -1000;
+    }
+    update(audioInput, time) {
+        let I = (audioInput * gain * 0.12) + this.inputCurrent + (Math.random() - 0.5) * noiseAmp;
+        for(let i=0; i<2; i++) {
+            this.v += 0.5 * (0.04 * this.v * this.v + 5 * this.v + 140 - this.u + I);
+            this.u += 0.5 * IZ_A * (IZ_B * this.v - this.u);
+        }
+        if (this.v >= V_PEAK) {
+            this.v = IZ_C; this.u += IZ_D;
+            this.firingStatus = 1.0; this.lastSpikeTime = time;
+            this.dispatchSpike(time);
+        } else { this.firingStatus *= 0.85; }
+        this.inputCurrent *= 0.5;
+    }
+    dispatchSpike(time) {
+        if (synapses.length > 800) return;
+        for (let i = 0; i < neurons.length; i++) {
+            let target = neurons[i]; if (this === target) continue;
+            let dx = this.pos.x - target.pos.x, dy = this.pos.y - target.pos.y, dz = this.pos.z - target.pos.z;
+            if (dx*dx + dy*dy + dz*dz < 40000) { 
+                let key = `${this.id}-${target.id}`, s = synapseMap.get(key);
+                if (!s && Math.random() < 0.02) {
+                    s = new Synapse(this, target); synapses.push(s); synapseMap.set(key, s);
+                } else if (s) {
+                    let dt = time - target.lastSpikeTime;
+                    if (dt > 0 && dt < 25) { s.weight = Math.min(3.5, s.weight * 1.05); s.life = Math.min(2.0, s.life + 0.05); }
+                }
+            }
+        }
+    }
+}
+
+class Synapse {
+    constructor(pre, post) {
+        this.pre = pre; this.post = post;
+        this.weight = pre.type === 'E' ? 1.4 : -2.2;
+        this.life = 1.0; this.key = `${pre.id}-${post.id}`;
+    }
+    update(crowded) {
+        if (this.pre.firingStatus > 0.8) {
+            this.post.inputCurrent += this.weight;
+            this.life = Math.min(2.0, this.life + 0.04); 
+        }
+        this.life -= crowded ? 0.02 : 0.01; 
+        if (this.life <= 0) { synapseMap.delete(this.key); return false; }
+        return true;
+    }
+}
+
+function init() {
+    neurons = []; synapses = []; synapseMap.clear();
+    for(let i=0; i<300; i++) neurons.push(new Neuron(i));
+}
+
+function updateEntity(avgFiringE, avgFiringI) {
+    let t = performance.now();
+    let wave = Math.sin(t * 0.0003) * 0.1;
+    let avoidanceSteer = 0;
+    let proximityAlert = false;
+
+    obstacles.forEach(obs => {
+        obs.x += obs.vx; obs.y += obs.vy;
+        obs.vx *= 0.92; obs.vy *= 0.92;
+        if (obs.x < obs.r) { obs.x = obs.r; obs.vx *= -1; }
+        if (obs.x > eCanvas.width - obs.r) { obs.x = eCanvas.width - obs.r; obs.vx *= -1; }
+        if (obs.y < obs.r) { obs.y = obs.r; obs.vy *= -1; }
+        if (obs.y > eCanvas.height - obs.r) { obs.y = eCanvas.height - obs.r; obs.vy *= -1; }
+
+        let dx = obs.x - agent.x, dy = obs.y - agent.y, dist = Math.sqrt(dx*dx + dy*dy);
+        if (dist < obs.r + 30) {
+            proximityAlert = true;
+            let angleToObs = Math.atan2(dy, dx);
+            avoidanceSteer += Math.sin(agent.angle - angleToObs) * 0.15;
+        }
+        if (dist < obs.r + agent.size) {
+            let collisionAngle = Math.atan2(dy, dx);
+            let pushForce = agent.speed * 0.5;
+            obs.vx += Math.cos(collisionAngle) * pushForce;
+            obs.vy += Math.sin(collisionAngle) * pushForce;
+            agent.angle = collisionAngle + Math.PI + (Math.random()-0.5);
+            agent.speed *= 0.6;
+        }
+    });
+
+    if (proximityAlert) noiseAmp = Math.min(1.8, noiseAmp + 0.03);
+    else noiseAmp = Math.max(0.1, noiseAmp - 0.01);
+
+    let drive = (avgFiringE + avgFiringI) * 4.5;
+    let steer = ((avgFiringE * 0.45) - (avgFiringI * 0.5)) + wave + avoidanceSteer;
+    agent.angle += steer + (Math.random() - 0.5) * 0.05;
+    agent.speed = agent.speed * 0.85 + drive * 0.25;
+    if (agent.speed > 6) agent.speed = 6;
+    agent.x += Math.cos(agent.angle) * agent.speed;
+    agent.y += Math.sin(agent.angle) * agent.speed;
+
+    if (agent.x < 0) agent.x = eCanvas.width; if (agent.x > eCanvas.width) agent.x = 0;
+    if (agent.y < 0) agent.y = eCanvas.height; if (agent.y > eCanvas.height) agent.y = 0;
+    agent.trail.push({x: agent.x, y: agent.y});
+    if (agent.trail.length > 25) agent.trail.shift();
+}
+
+function drawEntity() {
+    eCtx.fillStyle = 'rgba(0, 15, 25, 0.7)'; eCtx.fillRect(0, 0, eCanvas.width, eCanvas.height);
+    eCtx.save();
+    obstacles.forEach(obs => {
+        let speed = Math.sqrt(obs.vx*obs.vx + obs.vy*obs.vy);
+        eCtx.shadowBlur = 12; eCtx.shadowColor = eCtx.fillStyle = `rgb(${150 + speed * 20}, 40, 100)`;
+        eCtx.beginPath(); eCtx.arc(obs.x, obs.y, obs.r, 0, Math.PI*2); eCtx.fill();
+    });
+    eCtx.restore();
+    eCtx.beginPath(); eCtx.strokeStyle = '#00ffcc'; eCtx.lineWidth = 2;
+    agent.trail.forEach((p, i) => {
+        if (i > 0 && Math.hypot(p.x - agent.trail[i-1].x, p.y - agent.trail[i-1].y) < 50) eCtx.lineTo(p.x, p.y);
+        else eCtx.moveTo(p.x, p.y);
+    });
+    eCtx.stroke();
+    eCtx.fillStyle = '#fff'; eCtx.beginPath(); eCtx.arc(agent.x, agent.y, agent.size, 0, Math.PI*2); eCtx.fill();
+}
+
+function drawThought() {
+    tCtx.fillStyle = '#00080f'; tCtx.fillRect(0, 0, tCanvas.width, tCanvas.height);
+    if (history.length > tCanvas.width) history.shift();
+    let currentV = []; for(let i=0; i<5; i++) currentV.push(neurons[i].v);
+    history.push(currentV);
+    for(let i=0; i<5; i++) {
+        tCtx.beginPath(); tCtx.strokeStyle = i % 2 === 0 ? '#00ffcc' : '#ff2864';
+        for(let j=0; j<history.length; j++) {
+            let x = j, y = tCanvas.height - ((history[j][i] + 70) * (tCanvas.height / 110));
+            if (j === 0) tCtx.moveTo(x, y); else tCtx.lineTo(x, y);
+        }
+        tCtx.stroke();
+    }
+}
+
+function render() {
+    ctx.fillStyle = "rgba(0, 5, 10, 0.4)"; ctx.fillRect(0, 0, w, h);
+    if (analyser) analyser.getByteFrequencyData(audioData);
+    let time = performance.now(), totalE = 0, totalI = 0;
+    
+    let crowded = synapses.length > 500;
+    document.getElementById('modeStat').innerText = crowded ? "PRUNING ACTIVE" : "STABLE";
+    document.getElementById('modeStat').style.color = crowded ? "#ff2864" : "#00ffcc";
+
+    neurons.forEach(n => {
+        let input = audioData ? audioData[n.id % 128] : 0;
+        n.update(input, time);
+        if (n.type === 'E') totalE += n.firingStatus; else totalI += n.firingStatus;
+    });
+
+    // Feedback Sonoro
+    if (audioCtx && synthGain && soundEnabled) {
+        let globalActivity = (totalE + totalI) / neurons.length;
+        let targetGain = Math.min(0.12, globalActivity * 0.4); 
+        synthGain.gain.setTargetAtTime(targetGain, audioCtx.currentTime, 0.05);
+        let targetFreq = 100 + (totalE * 2.5);
+        oscillator.frequency.setTargetAtTime(targetFreq, audioCtx.currentTime, 0.1);
+    }
+    
+    synapses = synapses.filter(s => s.update(crowded));
+    document.getElementById('synCount').innerText = synapses.length;
+    
+    updateEntity(totalE / 240, totalI / 60);
+    drawEntity(); drawThought();
+    
+    let rot = time * 0.0003;
+    let projection = neurons.map(n => {
+        let x = n.pos.x * Math.cos(rot) - n.pos.z * Math.sin(rot), z = n.pos.x * Math.sin(rot) + n.pos.z * Math.cos(rot);
+        let scale = 850 / (z + 1000);
+        return { n, px: x * scale + w/2, py: n.pos.y * scale + h/2, sc: scale };
+    });
+    
+    synapses.forEach(s => {
+        let p1 = projection[s.pre.id], p2 = projection[s.post.id];
+        if (p1.sc > 0.1) {
+            ctx.strokeStyle = s.pre.type === 'E' ? `rgba(0, 255, 204, ${s.life * 0.2})` : `rgba(255, 40, 100, ${s.life * 0.2})`;
+            ctx.lineWidth = 0.5; ctx.beginPath(); ctx.moveTo(p1.px, p1.py); ctx.lineTo(p2.px, p2.py); ctx.stroke();
+        }
+    });
+    
+    projection.forEach(v => {
+        let fire = v.n.firingStatus;
+        ctx.fillStyle = fire > 0.5 ? "#fff" : (v.n.type === 'E' ? "#00cca3" : "#cc2850");
+        let r = (v.n.type === 'E' ? 2 : 3) * v.sc + (fire * 4);
+        ctx.beginPath(); ctx.arc(v.px, v.py, Math.max(0.5, r), 0, Math.PI*2); ctx.fill();
+    });
+    requestAnimationFrame(render);
+}
+
+document.getElementById('btn').onclick = async () => {
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    
+    oscillator = audioCtx.createOscillator();
+    synthGain = audioCtx.createGain();
+    oscillator.type = 'sine';
+    synthGain.gain.setValueAtTime(0, audioCtx.currentTime);
+    oscillator.connect(synthGain);
+    synthGain.connect(audioCtx.destination);
+    oscillator.start();
+
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const src = audioCtx.createMediaStreamSource(stream);
+        analyser = audioCtx.createAnalyser(); analyser.fftSize = 256;
+        audioData = new Uint8Array(analyser.frequencyBinCount);
+        src.connect(analyser);
+        document.getElementById('btn').innerText = "CORTEX ONLINE";
+        document.getElementById('btn').style.opacity = '0.3';
+    } catch(err) { alert("Mic access denied."); }
+};
+init(); render();
+</script>
+</body>
+</html>
